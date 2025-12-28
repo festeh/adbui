@@ -1,0 +1,16 @@
+[project]
+name = "adbui"
+version = "0.1.0"
+description = "Terminal UI for managing Android devices via ADB"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=6.11.0",
+    "zeroconf>=0.148.0",
+]
+
+[project.scripts]
+adbui = "main:main"
+
+[tool.setuptools]
+py-modules = ["main", "adb", "mdns"]
