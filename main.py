@@ -33,6 +33,7 @@ def merge_devices(
 ) -> list[UnifiedDevice]:
     """Merge ADB and mDNS device lists into unified view."""
     unified: dict[str, UnifiedDevice] = {}
+    address_to_key: dict[str, str] = {}  # Map IP:port -> device key
 
     # First, process mDNS devices (they have richer info)
     for md in mdns_devices:
@@ -51,43 +52,53 @@ def merge_devices(
                 dev.api_level = md.api_level
             if md.is_pairing:
                 dev.pairing = True
-                dev.address = md.address  # Use pairing address when pairing
+                dev.address = md.address
             else:
                 if not dev.address:
                     dev.address = md.address
+            # Track address mapping
+            if md.address:
+                address_to_key[md.address] = key
         else:
             unified[key] = UnifiedDevice(
                 name=md.device_name or md.instance_name,
                 address=md.address,
                 serial="",
                 api_level=md.api_level,
-                paired=False,  # mDNS discovery alone doesn't mean paired
+                paired=False,
                 pairing=md.is_pairing,
                 connected=False,
                 adb_state="",
             )
+            if md.address:
+                address_to_key[md.address] = key
 
     # Then, merge ADB devices
     for ad in adb_devices:
-        # Try to find matching mDNS device by ID in serial
-        matched = False
+        # Try to find matching mDNS device
+        matched_key = None
+
+        # Match by device ID in serial (e.g., "adb-DEVICEID-xxx._adb-tls...")
         for key in unified:
             if key in ad.serial:
-                dev = unified[key]
-                dev.serial = ad.serial
-                dev.connected = ad.state == DeviceState.DEVICE
-                dev.adb_state = ad.state.value
-                # Only mark as paired if ADB can actually connect
-                dev.paired = ad.state == DeviceState.DEVICE
-                if ad.model:
-                    dev.name = ad.model
-                matched = True
+                matched_key = key
                 break
 
-        if not matched:
+        # Match by IP:port (e.g., serial is "192.168.1.100:5555")
+        if not matched_key and ad.serial in address_to_key:
+            matched_key = address_to_key[ad.serial]
+
+        if matched_key:
+            dev = unified[matched_key]
+            dev.serial = ad.serial
+            dev.connected = ad.state == DeviceState.DEVICE
+            dev.adb_state = ad.state.value
+            dev.paired = ad.state == DeviceState.DEVICE
+            if ad.model:
+                dev.name = ad.model
+        else:
             # ADB device without mDNS match (USB or already connected by IP)
-            key = ad.serial
-            unified[key] = UnifiedDevice(
+            unified[ad.serial] = UnifiedDevice(
                 name=ad.model or ad.serial,
                 address=ad.serial if ":" in ad.serial else "",
                 serial=ad.serial,
@@ -346,7 +357,8 @@ class AdbUI(App):
         table.cursor_type = "row"
 
         self._discovery.start()
-        self.refresh_devices()
+        # Delay initial refresh to let mDNS discover devices
+        self.set_timer(0.5, self.refresh_devices)
 
     def on_unmount(self) -> None:
         set_log_callback(None)
@@ -354,8 +366,12 @@ class AdbUI(App):
         self._discovery.stop()
 
     def _on_discovery_update(self) -> None:
-        """Called when mDNS discovers/loses devices."""
-        self.call_from_thread(self.refresh_devices)
+        """Called from zeroconf thread when mDNS discovers/loses devices."""
+        self.call_from_thread(self._trigger_refresh)
+
+    def _trigger_refresh(self) -> None:
+        """Trigger refresh from main thread."""
+        self.refresh_devices()
 
     def _get_selected_device(self) -> UnifiedDevice | None:
         """Get currently selected device."""
@@ -398,7 +414,6 @@ class AdbUI(App):
         status.update(f"{len(self._devices)} device(s), {connected} connected")
 
     def action_refresh(self) -> None:
-        self._discovery.clear()  # Clear stale mDNS cache
         self.refresh_devices()
 
     def action_toggle_logs(self) -> None:
