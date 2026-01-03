@@ -52,10 +52,9 @@ def merge_devices(
                 dev.api_level = md.api_level
             if md.is_pairing:
                 dev.pairing = True
-                dev.address = md.address
             else:
-                if not dev.address:
-                    dev.address = md.address
+                # Connect service - always use this address (it's the real connection port)
+                dev.address = md.address
             # Track address mapping
             if md.address:
                 address_to_key[md.address] = key
@@ -96,6 +95,9 @@ def merge_devices(
             dev.paired = ad.state == DeviceState.DEVICE
             if ad.model:
                 dev.name = ad.model
+            # Use ADB serial as address if it's IP:port (actual connection)
+            if ":" in ad.serial and "._adb" not in ad.serial:
+                dev.address = ad.serial
         else:
             # ADB device without mDNS match (USB or already connected by IP)
             unified[ad.serial] = UnifiedDevice(
