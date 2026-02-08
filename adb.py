@@ -6,6 +6,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable
 
+from log import logger
+
 # Global log callback
 _log_callback: Callable[[str], None] | None = None
 
@@ -17,7 +19,8 @@ def set_log_callback(callback: Callable[[str], None] | None) -> None:
 
 
 def _log(msg: str) -> None:
-    """Log a message."""
+    """Log a message to UI and file."""
+    logger.info(msg)
     if _log_callback:
         timestamp = datetime.now().strftime("%H:%M:%S")
         _log_callback(f"[{timestamp}] {msg}")

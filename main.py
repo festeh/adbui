@@ -9,142 +9,105 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Loa
 from textual.screen import ModalScreen
 
 import adb
-from adb import DeviceState, set_log_callback
+from adb import set_log_callback
+from log import setup_logging
 from mdns import ADBDiscovery, DiscoveredDevice, set_mdns_log_callback
 
 
 @dataclass
-class UnifiedDevice:
-    """Merged device info from ADB and mDNS."""
-    name: str  # From mDNS device_name or ADB model
-    address: str  # IP:port for connect
-    pairing_address: str  # IP:port for pairing (different port)
-    serial: str  # ADB serial (for disconnect)
+class Device:
+    """Merged device info from ADB and mDNS. Raw observations only."""
+    name: str
+    address: str  # IP:port from mDNS connect service
+    pairing_address: str  # IP:port from mDNS pairing service
+    serial: str  # ADB serial
+    adb_state: str  # "device", "offline", "unauthorized", ""
     api_level: int
-    paired: bool  # Seen via _adb-tls-connect._tcp
-    pairing: bool  # Currently in pairing mode
-    connected: bool  # ADB state is "device"
-    adb_state: str  # Raw ADB state
 
 
 def merge_devices(
     adb_devices: list[adb.Device],
     mdns_devices: list[DiscoveredDevice],
-) -> list[UnifiedDevice]:
+) -> list[Device]:
     """Merge ADB and mDNS device lists into unified view."""
-    unified: dict[str, UnifiedDevice] = {}
-    address_to_key: dict[str, str] = {}  # Map IP:port -> device key
+    unified: dict[str, Device] = {}
+    address_to_key: dict[str, str] = {}
 
     # First, process mDNS devices (they have richer info)
     for md in mdns_devices:
-        # Extract device ID from instance name (e.g., "adb-RFAW70DK06L-IqBWav" -> "RFAW70DK06L")
         parts = md.instance_name.split("-")
-        device_id = parts[1] if len(parts) > 1 else md.instance_name
-
-        key = device_id
+        key = parts[1] if len(parts) > 1 else md.instance_name
 
         if key in unified:
-            # Update existing entry
             dev = unified[key]
             if md.device_name:
                 dev.name = md.device_name
             if md.api_level:
                 dev.api_level = md.api_level
             if md.is_pairing:
-                dev.pairing = True
                 dev.pairing_address = md.address
             else:
-                # Connect service - device was previously paired
                 dev.address = md.address
-                dev.paired = True
-            # Track address mapping
-            if md.address:
-                address_to_key[md.address] = key
         else:
-            is_pairing = md.is_pairing
-            unified[key] = UnifiedDevice(
+            unified[key] = Device(
                 name=md.device_name or md.instance_name,
-                address="" if is_pairing else md.address,
-                pairing_address=md.address if is_pairing else "",
+                address="" if md.is_pairing else md.address,
+                pairing_address=md.address if md.is_pairing else "",
                 serial="",
-                api_level=md.api_level,
-                paired=not is_pairing,
-                pairing=is_pairing,
-                connected=False,
                 adb_state="",
+                api_level=md.api_level,
             )
-            if md.address:
-                address_to_key[md.address] = key
+
+        if md.address:
+            address_to_key[md.address] = key
 
     # Then, merge ADB devices
     for ad in adb_devices:
-        # Try to find matching mDNS device
         matched_key = None
-
-        # Match by device ID in serial (e.g., "adb-DEVICEID-xxx._adb-tls...")
         for key in unified:
             if key in ad.serial:
                 matched_key = key
                 break
-
-        # Match by IP:port (e.g., serial is "192.168.1.100:5555")
         if not matched_key and ad.serial in address_to_key:
             matched_key = address_to_key[ad.serial]
 
         if matched_key:
             dev = unified[matched_key]
             dev.serial = ad.serial
-            dev.connected = ad.state == DeviceState.DEVICE
             dev.adb_state = ad.state.value
-            dev.paired = True
             if ad.model:
                 dev.name = ad.model
-            # Use ADB serial as address if it's IP:port (actual connection)
             if ":" in ad.serial and "._adb" not in ad.serial:
                 dev.address = ad.serial
         else:
-            # ADB device without mDNS match (USB or already connected by IP)
-            unified[ad.serial] = UnifiedDevice(
+            unified[ad.serial] = Device(
                 name=ad.model or ad.serial,
                 address=ad.serial if ":" in ad.serial else "",
                 pairing_address="",
                 serial=ad.serial,
-                api_level=0,
-                paired=True,
-                pairing=False,
-                connected=ad.state == DeviceState.DEVICE,
                 adb_state=ad.state.value,
+                api_level=0,
             )
 
     return list(unified.values())
 
 
-def get_status(dev: UnifiedDevice) -> tuple[str, str]:
-    """Get status strings based on device state.
+def get_status(dev: Device) -> tuple[str, str]:
+    """Derive display status from raw device data.
 
     Returns (paired_status, connection_status).
-    States are mutually exclusive - no guessing or fallbacks.
     """
-    # Pairing mode: device is broadcasting pairing service
-    if dev.pairing:
+    if dev.pairing_address:
         return ("Pairing", "Enter code")
-
-    # Connected: ADB reports device is ready
-    if dev.connected:
+    if dev.adb_state == "device":
         return ("Paired", "Connected")
-
-    # ADB states (device known to ADB but not fully connected)
-    if dev.adb_state == "offline":
-        return ("Paired", "Offline")
     if dev.adb_state == "unauthorized":
         return ("Paired", "Unauthorized")
-
-    # Discovered via mDNS connect service (previously paired)
+    if dev.adb_state == "offline":
+        return ("—", "Offline")
     if dev.address:
-        return ("Paired", "Disconnected")
-
-    # Fallback (shouldn't happen with current merge logic)
-    return ("Unknown", "Unknown")
+        return ("—", "Disconnected")
+    return ("—", "—")
 
 
 class PairScreen(ModalScreen[bool]):
@@ -333,7 +296,7 @@ class AdbUI(App):
     def __init__(self):
         super().__init__()
         self._discovery = ADBDiscovery(on_update=self._on_discovery_update)
-        self._devices: list[UnifiedDevice] = []
+        self._devices: list[Device] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -378,7 +341,7 @@ class AdbUI(App):
         """Called from zeroconf thread when mDNS discovers/loses devices."""
         self.call_from_thread(self.refresh_devices)
 
-    def _get_selected_device(self) -> UnifiedDevice | None:
+    def _get_selected_device(self) -> Device | None:
         """Get currently selected device."""
         table = self.query_one("#device-table", DataTable)
         if table.row_count == 0:
@@ -415,7 +378,7 @@ class AdbUI(App):
             )
 
         loading.remove_class("visible")
-        connected = sum(1 for d in self._devices if d.connected)
+        connected = sum(1 for d in self._devices if d.adb_state == "device")
         status.update(f"{len(self._devices)} device(s), {connected} connected")
 
     def action_refresh(self) -> None:
@@ -446,7 +409,7 @@ class AdbUI(App):
         if not dev:
             self.notify("No device selected", severity="warning")
             return
-        if not dev.pairing or not dev.pairing_address:
+        if not dev.pairing_address:
             self.notify("Device not in pairing mode", severity="warning")
             return
 
@@ -490,18 +453,17 @@ class AdbUI(App):
         if not dev:
             return
 
-        if dev.pairing:
+        if dev.pairing_address:
             self.action_pair()
-        elif dev.paired and not dev.connected and dev.address:
+        elif dev.address and dev.adb_state != "device":
             success, msg = await adb.connect(dev.address)
             self.notify(msg, severity="information" if success else "error", markup=False)
             if success:
                 self.refresh_devices()
-        elif not dev.paired:
-            self.notify("Device needs pairing first", severity="warning")
 
 
 def main():
+    setup_logging()
     app = AdbUI()
     app.run()
 

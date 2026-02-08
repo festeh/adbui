@@ -8,6 +8,7 @@ from typing import Callable
 
 from zeroconf import ServiceStateChange, Zeroconf, ServiceBrowser
 
+from log import logger
 
 # Log callback (set by main app)
 _log_callback: Callable[[str], None] | None = None
@@ -19,6 +20,7 @@ def set_mdns_log_callback(callback: Callable[[str], None] | None) -> None:
 
 
 def _log(msg: str) -> None:
+    logger.info("[mDNS] %s", msg)
     if _log_callback:
         timestamp = datetime.now().strftime("%H:%M:%S")
         _log_callback(f"[{timestamp}] [mDNS] {msg}")
