@@ -39,17 +39,6 @@ class Device:
     product: str = ""
     transport_id: str = ""
 
-    @property
-    def display_name(self) -> str:
-        if self.model:
-            return f"{self.model} ({self.serial})"
-        return self.serial
-
-    @property
-    def is_wireless(self) -> bool:
-        # IP:port format or mDNS format (_adb-tls-connect._tcp)
-        return ":" in self.serial or "._adb" in self.serial
-
 
 async def run_adb(*args: str) -> tuple[int, str, str]:
     """Run an adb command and return (returncode, stdout, stderr)."""
@@ -128,12 +117,6 @@ async def disconnect(address: str) -> tuple[bool, str]:
     code, stdout, stderr = await run_adb("disconnect", address)
     output = stdout + stderr
     return code == 0, output.strip()
-
-
-async def disconnect_all() -> tuple[bool, str]:
-    """Disconnect all devices."""
-    code, stdout, stderr = await run_adb("disconnect")
-    return code == 0, (stdout + stderr).strip()
 
 
 async def pair(address: str, code: str) -> tuple[bool, str]:

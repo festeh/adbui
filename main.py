@@ -1,11 +1,10 @@
 """ADB TUI - A terminal UI for managing Android devices."""
 
-from collections import deque
 from dataclasses import dataclass
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, LoadingIndicator, RichLog, Static
 from textual.screen import ModalScreen
 
@@ -19,6 +18,7 @@ class UnifiedDevice:
     """Merged device info from ADB and mDNS."""
     name: str  # From mDNS device_name or ADB model
     address: str  # IP:port for connect
+    pairing_address: str  # IP:port for pairing (different port)
     serial: str  # ADB serial (for disconnect)
     api_level: int
     paired: bool  # Seen via _adb-tls-connect._tcp
@@ -52,20 +52,24 @@ def merge_devices(
                 dev.api_level = md.api_level
             if md.is_pairing:
                 dev.pairing = True
+                dev.pairing_address = md.address
             else:
-                # Connect service - always use this address (it's the real connection port)
+                # Connect service - device was previously paired
                 dev.address = md.address
+                dev.paired = True
             # Track address mapping
             if md.address:
                 address_to_key[md.address] = key
         else:
+            is_pairing = md.is_pairing
             unified[key] = UnifiedDevice(
                 name=md.device_name or md.instance_name,
-                address=md.address,
+                address="" if is_pairing else md.address,
+                pairing_address=md.address if is_pairing else "",
                 serial="",
                 api_level=md.api_level,
-                paired=False,
-                pairing=md.is_pairing,
+                paired=not is_pairing,
+                pairing=is_pairing,
                 connected=False,
                 adb_state="",
             )
@@ -92,7 +96,7 @@ def merge_devices(
             dev.serial = ad.serial
             dev.connected = ad.state == DeviceState.DEVICE
             dev.adb_state = ad.state.value
-            dev.paired = ad.state == DeviceState.DEVICE
+            dev.paired = True
             if ad.model:
                 dev.name = ad.model
             # Use ADB serial as address if it's IP:port (actual connection)
@@ -103,9 +107,10 @@ def merge_devices(
             unified[ad.serial] = UnifiedDevice(
                 name=ad.model or ad.serial,
                 address=ad.serial if ":" in ad.serial else "",
+                pairing_address="",
                 serial=ad.serial,
                 api_level=0,
-                paired=ad.state == DeviceState.DEVICE,
+                paired=True,
                 pairing=False,
                 connected=ad.state == DeviceState.DEVICE,
                 adb_state=ad.state.value,
@@ -202,6 +207,9 @@ class ConnectScreen(ModalScreen[bool]):
             with Horizontal(id="connect-buttons"):
                 yield Button("Connect", variant="primary", id="btn-connect")
                 yield Button("Cancel", id="btn-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#connect-address", Input).focus()
 
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -326,7 +334,6 @@ class AdbUI(App):
         super().__init__()
         self._discovery = ADBDiscovery(on_update=self._on_discovery_update)
         self._devices: list[UnifiedDevice] = []
-        self._log_visible = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -369,11 +376,7 @@ class AdbUI(App):
 
     def _on_discovery_update(self) -> None:
         """Called from zeroconf thread when mDNS discovers/loses devices."""
-        self.call_from_thread(self._trigger_refresh)
-
-    def _trigger_refresh(self) -> None:
-        """Trigger refresh from main thread."""
-        self.refresh_devices()
+        self.call_from_thread(self.refresh_devices)
 
     def _get_selected_device(self) -> UnifiedDevice | None:
         """Get currently selected device."""
@@ -420,12 +423,7 @@ class AdbUI(App):
 
     def action_toggle_logs(self) -> None:
         """Toggle log panel visibility."""
-        log_panel = self.query_one("#log-panel", RichLog)
-        self._log_visible = not self._log_visible
-        if self._log_visible:
-            log_panel.add_class("visible")
-        else:
-            log_panel.remove_class("visible")
+        self.query_one("#log-panel", RichLog).toggle_class("visible")
 
     async def action_connect(self) -> None:
         dev = self._get_selected_device()
@@ -448,7 +446,7 @@ class AdbUI(App):
         if not dev:
             self.notify("No device selected", severity="warning")
             return
-        if not dev.pairing or not dev.address:
+        if not dev.pairing or not dev.pairing_address:
             self.notify("Device not in pairing mode", severity="warning")
             return
 
@@ -456,7 +454,7 @@ class AdbUI(App):
             if success:
                 self.refresh_devices()
 
-        self.push_screen(PairScreen(address=dev.address, device_name=dev.name), on_dismiss)
+        self.push_screen(PairScreen(address=dev.pairing_address, device_name=dev.name), on_dismiss)
 
     async def action_disconnect(self) -> None:
         dev = self._get_selected_device()

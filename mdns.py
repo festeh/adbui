@@ -68,12 +68,6 @@ class ADBDiscovery:
         with self._lock:
             return list(self._devices.values())
 
-    def clear(self) -> None:
-        """Clear cached devices (thread-safe)."""
-        with self._lock:
-            self._devices.clear()
-        _log("Cache cleared")
-
     def start(self) -> None:
         """Start mDNS discovery."""
         if self._zeroconf:
