@@ -1,6 +1,6 @@
 """ADB TUI - A terminal UI for managing Android devices."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -18,11 +18,26 @@ from mdns import ADBDiscovery, DiscoveredDevice, set_mdns_log_callback
 class Device:
     """Merged device info from ADB and mDNS. Raw observations only."""
     name: str
-    address: str  # IP:port from mDNS connect service
+    address: str  # IP:port display address (highest port heuristic)
     pairing_address: str  # IP:port from mDNS pairing service
     serial: str  # ADB serial
     adb_state: str  # "device", "offline", "unauthorized", ""
     api_level: int
+    connect_addresses: list[str] = field(default_factory=list)  # all known connect addresses
+
+
+def _pick_address(addresses: list[str]) -> str:
+    """Pick display address from candidates: prefer highest port."""
+    if not addresses:
+        return ""
+
+    def port_of(addr: str) -> int:
+        try:
+            return int(addr.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            return 0
+
+    return max(addresses, key=port_of)
 
 
 def merge_devices(
@@ -46,16 +61,18 @@ def merge_devices(
                 dev.api_level = md.api_level
             if md.is_pairing:
                 dev.pairing_address = md.address
-            else:
-                dev.address = md.address
+            elif md.address and md.address not in dev.connect_addresses:
+                dev.connect_addresses.append(md.address)
         else:
+            connect_addrs = [md.address] if (not md.is_pairing and md.address) else []
             unified[key] = Device(
                 name=md.device_name or md.instance_name,
-                address="" if md.is_pairing else md.address,
+                address="",
                 pairing_address=md.address if md.is_pairing else "",
                 serial="",
                 adb_state="",
                 api_level=md.api_level,
+                connect_addresses=connect_addrs,
             )
 
         if md.address:
@@ -78,18 +95,25 @@ def merge_devices(
             if ad.model:
                 dev.name = ad.model
             if ":" in ad.serial and "._adb" not in ad.serial:
-                dev.address = ad.serial
+                if ad.serial not in dev.connect_addresses:
+                    dev.connect_addresses.append(ad.serial)
         else:
+            addr = ad.serial if ":" in ad.serial else ""
             unified[ad.serial] = Device(
                 name=ad.model or ad.serial,
-                address=ad.serial if ":" in ad.serial else "",
+                address="",
                 pairing_address="",
                 serial=ad.serial,
                 adb_state=ad.state.value,
                 api_level=0,
+                connect_addresses=[addr] if addr else [],
             )
 
-    return list(unified.values())
+    # Set display address: highest port heuristic
+    result = list(unified.values())
+    for dev in result:
+        dev.address = _pick_address(dev.connect_addresses)
+    return result
 
 
 def get_status(dev: Device) -> tuple[str, str]:
@@ -388,21 +412,38 @@ class AdbUI(App):
         """Toggle log panel visibility."""
         self.query_one("#log-panel", RichLog).toggle_class("visible")
 
+    async def _try_connect(self, dev: Device) -> bool:
+        """Try connecting using all known addresses. Updates display on success."""
+        # Try preferred address first, then alternatives
+        addresses = []
+        if dev.address:
+            addresses.append(dev.address)
+        for addr in dev.connect_addresses:
+            if addr not in addresses:
+                addresses.append(addr)
+
+        for addr in addresses:
+            success, msg = await adb.connect(addr)
+            if success:
+                dev.address = addr
+                self.notify(msg, severity="information", markup=False)
+                self.refresh_devices()
+                return True
+
+        self.notify("Failed to connect", severity="error")
+        return False
+
     async def action_connect(self) -> None:
         dev = self._get_selected_device()
 
-        if dev and dev.address:
-            # Connect directly if device selected
-            success, msg = await adb.connect(dev.address)
-            self.notify(msg, severity="information" if success else "error", markup=False)
-            if success:
-                self.refresh_devices()
+        if dev and dev.connect_addresses:
+            await self._try_connect(dev)
         else:
             # Show dialog for manual entry
             def on_dismiss(success: bool) -> None:
                 if success:
                     self.refresh_devices()
-            self.push_screen(ConnectScreen(), on_dismiss)
+            self.push_screen(ConnectScreen(address=dev.address if dev else ""), on_dismiss)
 
     def action_pair(self) -> None:
         dev = self._get_selected_device()
@@ -455,11 +496,8 @@ class AdbUI(App):
 
         if dev.pairing_address:
             self.action_pair()
-        elif dev.address and dev.adb_state != "device":
-            success, msg = await adb.connect(dev.address)
-            self.notify(msg, severity="information" if success else "error", markup=False)
-            if success:
-                self.refresh_devices()
+        elif dev.connect_addresses and dev.adb_state != "device":
+            await self._try_connect(dev)
 
 
 def main():

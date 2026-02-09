@@ -13,4 +13,4 @@ dependencies = [
 adbui = "main:main"
 
 [tool.setuptools]
-py-modules = ["main", "adb", "mdns"]
+py-modules = ["main", "adb", "mdns", "log"]
